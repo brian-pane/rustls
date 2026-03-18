@@ -96,6 +96,14 @@ impl SupportedCipherSuite {
             Self::Tls13(tls13) => tls13.usable_for_protocol(proto),
         }
     }
+
+    /// Return true if this suite is usable for the given [`KeyExchangeAlgorithm`].
+    pub(crate) fn usable_for_kx_algorithm(&self, kxa: KeyExchangeAlgorithm) -> bool {
+        match self {
+            Self::Tls12(tls12) => tls12.usable_for_kx_algorithm(kxa),
+            Self::Tls13(tls13) => tls13.usable_for_kx_algorithm(kxa),
+        }
+    }
 }
 
 impl fmt::Debug for SupportedCipherSuite {

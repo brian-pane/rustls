@@ -24,7 +24,7 @@ use crate::msgs::ServerNamePayload;
 use crate::sync::Arc;
 use crate::time_provider::{DefaultTimeProvider, TimeProvider};
 use crate::verify::{ClientVerifier, DistinguishedName, NoClientAuth};
-use crate::{KeyLog, NoKeyLog, compress};
+use crate::{KeyLog, NoKeyLog, SupportedCipherSuite, compress};
 
 /// Common configuration for a set of server sessions.
 ///
@@ -82,10 +82,8 @@ pub struct ServerConfig {
     /// Source of randomness and other crypto.
     pub(crate) provider: Arc<CryptoProvider>,
 
-    /// Ignore the client's ciphersuite order. Instead,
-    /// choose the top ciphersuite in the server list
-    /// which is supported by the client.
-    pub ignore_client_order: bool,
+    /// How to select a cipher suite to use for a TLS session.
+    pub cipher_suite_selector: &'static dyn CipherSuiteSelector,
 
     /// The maximum size of plaintext input to be emitted in a single TLS record.
     /// A value of None is equivalent to the [TLS maximum] of 16 kB.
@@ -674,7 +672,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
         let require_ems = !matches!(self.provider.fips(), FipsStatus::Unvalidated);
         Ok(ServerConfig {
             provider: self.provider,
-            ignore_client_order: false,
+            cipher_suite_selector: &DEFAULT_CIPHER_SUITE_SELECTOR,
             max_fragment_size: None,
             session_storage: handy::ServerSessionMemoryCache::new(256),
             ticketer: None,
@@ -695,3 +693,71 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
         })
     }
 }
+
+/// A filter that chooses the cipher suite to use for a TLS session.
+pub trait CipherSuiteSelector: Debug + Send + Sync {
+    /// Choose a cipher suite, given the server's and client's order lists of supported options.
+    fn select_cipher_suite(
+        &self,
+        client_suites: &[CipherSuite],
+        server_suites: &[SupportedCipherSuite],
+    ) -> Option<SupportedCipherSuite>;
+}
+
+/// A simple implementation of CipherSuiteSelector that balances client and server preferences.
+///
+/// If the server is configured to ignore the client's cipher suite ordering, but the first
+/// cipher suite in the client's preferred list uses ChaCha20, the server prioritizes ChaCha20
+/// cipher suites.
+#[derive(Debug)]
+struct DefaultCipherSuiteSelector;
+
+impl CipherSuiteSelector for DefaultCipherSuiteSelector {
+    fn select_cipher_suite(
+        &self,
+        client_suites: &[CipherSuite],
+        server_suites: &[SupportedCipherSuite],
+    ) -> Option<SupportedCipherSuite> {
+        const CHACHA20_SUITES: [CipherSuite; 8] = [
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_DHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_RSA_PSK_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_PSK_WITH_CHACHA20_POLY1305_SHA256,
+        ];
+
+        if client_suites
+            .first()
+            .is_some_and(|suite| CHACHA20_SUITES.contains(suite))
+        {
+            // Make a copy of the server's supported cipher suite list with the ChaCha20 ciphers
+            // moved to the front, and then find the first match with the client's list.
+            let mut prioritized_suites: Vec<SupportedCipherSuite> =
+                Vec::with_capacity(server_suites.len());
+            prioritized_suites.extend(
+                server_suites
+                    .iter()
+                    .filter(|server_suite| CHACHA20_SUITES.contains(&server_suite.suite())),
+            );
+            prioritized_suites.extend(
+                server_suites
+                    .iter()
+                    .filter(|server_suite| !CHACHA20_SUITES.contains(&server_suite.suite())),
+            );
+            prioritized_suites
+                .iter()
+                .find(|server_suite| client_suites.contains(&server_suite.suite()))
+                .copied()
+        } else {
+            server_suites
+                .iter()
+                .find(|server_suite| client_suites.contains(&server_suite.suite()))
+                .copied()
+        }
+    }
+}
+
+static DEFAULT_CIPHER_SUITE_SELECTOR: DefaultCipherSuiteSelector = DefaultCipherSuiteSelector;

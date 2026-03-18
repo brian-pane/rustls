@@ -582,11 +582,16 @@ impl ExpectClientHello {
         )?;
 
         debug!("decided upon suite {suite:?}");
-        output.output(OutputEvent::CipherSuite(suite.into()));
+        output.output(OutputEvent::CipherSuite(suite));
 
-        suite
-            .server_handler()
-            .handle_client_hello(suite, skxg, credentials, input, self, output)
+        match suite {
+            SupportedCipherSuite::Tls12(tls12) => tls12
+                .server_handler()
+                .handle_client_hello(tls12, skxg, credentials, input, self, output),
+            SupportedCipherSuite::Tls13(tls13) => tls13
+                .server_handler()
+                .handle_client_hello(tls13, skxg, credentials, input, self, output),
+        }
     }
 
     fn choose_suite_and_kx_group<T: Suite + 'static>(
@@ -595,7 +600,10 @@ impl ExpectClientHello {
         sig_scheme: SignatureScheme,
         client_groups: &[NamedGroup],
         client_suites: &[CipherSuite],
-    ) -> Result<(&'static T, &'static dyn SupportedKxGroup), PeerIncompatible> {
+    ) -> Result<(SupportedCipherSuite, &'static dyn SupportedKxGroup), PeerIncompatible>
+    where
+        SupportedCipherSuite: From<&'static T>,
+    {
         // Determine which `KeyExchangeAlgorithm`s are theoretically possible, based
         // on the offered and supported groups.
         let mut ecdhe_possible = false;
@@ -644,7 +652,7 @@ impl ExpectClientHello {
             return Err(PeerIncompatible::NoKxGroupsInCommon);
         }
 
-        let mut suitable_suites_iter = suites.iter().filter(|suite| {
+        let suitable_suites_iter = suites.iter().filter(|suite| {
             // Reduce our supported ciphersuites by the certified key's algorithm.
             suite.usable_for_signature_scheme(sig_scheme)
                 // And support for one of the key exchange groups
@@ -658,20 +666,14 @@ impl ExpectClientHello {
         // proposes FFDHE4096 and we only support FFDHE2048), so we ignore that requirement here,
         // and continue to send HandshakeFailure.
 
-        let suite = if self.config.ignore_client_order {
-            suitable_suites_iter.find(|suite| client_suites.contains(&suite.suite()))
-        } else {
-            let suitable_suites = suitable_suites_iter.collect::<Vec<_>>();
-            client_suites
-                .iter()
-                .find_map(|client_suite| {
-                    suitable_suites
-                        .iter()
-                        .find(|x| *client_suite == x.suite())
-                })
-                .copied()
-        }
-        .ok_or(PeerIncompatible::NoCipherSuitesInCommon)?;
+        let server_suites = suitable_suites_iter
+            .map(|x| SupportedCipherSuite::from(x))
+            .collect::<Vec<_>>();
+        let suite = self
+            .config
+            .cipher_suite_selector
+            .select_cipher_suite(client_suites, server_suites.as_slice())
+            .ok_or(PeerIncompatible::NoCipherSuitesInCommon)?;
 
         // Finally, choose a key exchange group that is compatible with the selected cipher
         // suite.
